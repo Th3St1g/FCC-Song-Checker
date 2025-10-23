@@ -129,7 +129,7 @@ def analyze_track_lyrics(track_obj, track_number, flagged_words):
     lyrics, genius_url = get_lyrics_from_genius(title_clean, main_artist)
     if lyrics is None:
         return {"track_number": track_number, "track_name": track_obj["name"], "status": "Lyrics Not Found", "flagged_words": [], "genius_url": None, "lrclib_url": lrclib_url}
-    
+
     found_words = [w for w in flagged_words if re.search(rf"\b{re.escape(w)}\b", lyrics, re.IGNORECASE)]
     status = "Explicit" if found_words else "Clean"
     return {"track_number": track_number, "track_name": track_obj["name"], "status": status, "flagged_words": found_words, "genius_url": genius_url, "lrclib_url": None}
@@ -174,7 +174,7 @@ def me():
     user_profile = sp.current_user()
     return jsonify({"logged_in": True, "id": user_profile.get("id"), "name": user_profile.get("display_name", "Unknown")})
 
-# --- NEW SEARCH ROUTE (with fix) ---
+# --- SEARCH ROUTE (Tracks and Albums Only, Improved Relevance) ---
 @app.route("/search", methods=["POST"])
 def search():
     token_info = refresh_token_if_needed()
@@ -185,56 +185,51 @@ def search():
     if not query: return jsonify({"error": "No query provided."}), 400
 
     sp = spotipy.Spotify(auth=token_info["access_token"])
-    
+
+    # Use the original query without wildcard for better relevance
+    search_query = query
+
     try:
-        # Search for all types, limit to 5 of each
-        results = sp.search(q=query, type='track,album,playlist', limit=5)
-        
+        # Changed type to exclude playlists and added market
+        results = sp.search(q=search_query, type='track,album', limit=5, market='US')
+
         formatted_results = []
-        
+
         # Format tracks
-        # MODIFIED LINE: Use .get() for a safer check
-        if results.get('tracks'): 
+        if results.get('tracks'):
             for item in results['tracks']['items']:
+                # Skip tracks with no artist (rare edge case)
+                if not item.get('artists'): continue
                 formatted_results.append({
                     "type": "Track",
                     "name": item['name'],
                     "artist": item['artists'][0]['name'],
-                    "cover": item['album']['images'][-1]['url'] if item['album']['images'] else None, # Get smallest cover
+                    "cover": item['album']['images'][-1]['url'] if item.get('album') and item['album']['images'] else None,
                     "url": item['external_urls']['spotify']
                 })
 
         # Format albums
-        # MODIFIED LINE: Use .get() for a safer check
         if results.get('albums'):
             for item in results['albums']['items']:
+                 # Skip albums with no artist (rare edge case)
+                if not item.get('artists'): continue
                 formatted_results.append({
                     "type": "Album",
                     "name": item['name'],
                     "artist": item['artists'][0]['name'],
-                    "cover": item['images'][-1]['url'] if item['images'] else None,
+                    "cover": item['images'][-1]['url'] if item.get('images') and item['images'] else None,
                     "url": item['external_urls']['spotify']
                 })
-        
-        # Format playlists
-        # MODIFIED LINE: Use .get() for a safer check
-        if results.get('playlists'):
-            for item in results['playlists']['items']:
-                formatted_results.append({
-                    "type": "Playlist",
-                    "name": item['name'],
-                    "artist": f"by {item['owner']['display_name']}",
-                    "cover": item['images'][-1]['url'] if item['images'] else None,
-                    "url": item['external_urls']['spotify']
-                })
-        
-        # Return max 10 total results
-        return jsonify(formatted_results[:10]) 
+
+        # Return max 10 total results (5 tracks + 5 albums)
+        return jsonify(formatted_results[:10])
 
     except Exception as e:
-        # This will print the *actual* error to your Render logs for easier debugging
-        print(f"!!! SEARCH CRASH: {str(e)}") 
-        return jsonify({"error": f"Spotify API error: {str(e)}"}), 400
+        print(f"!!! SEARCH CRASH: {str(e)}")
+        error_message = f"Spotify API error: {str(e)}"
+        if hasattr(e, 'http_status'):
+             error_message = f"Spotify API error ({e.http_status}): {e.msg}"
+        return jsonify({"error": error_message}), 400
 
 
 @app.route("/progress")
@@ -247,7 +242,7 @@ def progress():
 def analyze():
     token_info = refresh_token_if_needed()
     if not token_info: return jsonify({"error": "User not logged in. Please log in again."}), 401
-    
+
     data = request.get_json()
     url = data.get("url")
     custom_words_str = data.get("custom_words", "")
