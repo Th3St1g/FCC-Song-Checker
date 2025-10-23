@@ -174,7 +174,7 @@ def me():
     user_profile = sp.current_user()
     return jsonify({"logged_in": True, "id": user_profile.get("id"), "name": user_profile.get("display_name", "Unknown")})
 
-# --- NEW SEARCH ROUTE ---
+# --- NEW SEARCH ROUTE (with fix) ---
 @app.route("/search", methods=["POST"])
 def search():
     token_info = refresh_token_if_needed()
@@ -193,7 +193,8 @@ def search():
         formatted_results = []
         
         # Format tracks
-        if 'tracks' in results:
+        # MODIFIED LINE: Use .get() for a safer check
+        if results.get('tracks'): 
             for item in results['tracks']['items']:
                 formatted_results.append({
                     "type": "Track",
@@ -204,7 +205,8 @@ def search():
                 })
 
         # Format albums
-        if 'albums' in results:
+        # MODIFIED LINE: Use .get() for a safer check
+        if results.get('albums'):
             for item in results['albums']['items']:
                 formatted_results.append({
                     "type": "Album",
@@ -215,7 +217,8 @@ def search():
                 })
         
         # Format playlists
-        if 'playlists' in results:
+        # MODIFIED LINE: Use .get() for a safer check
+        if results.get('playlists'):
             for item in results['playlists']['items']:
                 formatted_results.append({
                     "type": "Playlist",
@@ -229,7 +232,10 @@ def search():
         return jsonify(formatted_results[:10]) 
 
     except Exception as e:
+        # This will print the *actual* error to your Render logs for easier debugging
+        print(f"!!! SEARCH CRASH: {str(e)}") 
         return jsonify({"error": f"Spotify API error: {str(e)}"}), 400
+
 
 @app.route("/progress")
 def progress():
@@ -283,7 +289,7 @@ def analyze():
             tracks_to_process = [item["track"] for item in items if item.get("track")]
             response_data.update({"name": playlist_info["name"], "owner": playlist_info["owner"]["display_name"], "cover": playlist_info["images"][0]["url"] if playlist_info["images"] else None})
     except Exception as e:
-        return jsonify({"error": f"Spotify API error: {str(e)}"}), 400
+        return jsonify({"error": f"Spotify API error: {str(e)}"}), 500
 
     analysis_results = []
     total_tracks = len(tracks_to_process)
