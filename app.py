@@ -174,6 +174,63 @@ def me():
     user_profile = sp.current_user()
     return jsonify({"logged_in": True, "id": user_profile.get("id"), "name": user_profile.get("display_name", "Unknown")})
 
+# --- NEW SEARCH ROUTE ---
+@app.route("/search", methods=["POST"])
+def search():
+    token_info = refresh_token_if_needed()
+    if not token_info: return jsonify({"error": "User not logged in."}), 401
+
+    data = request.get_json()
+    query = data.get("query")
+    if not query: return jsonify({"error": "No query provided."}), 400
+
+    sp = spotipy.Spotify(auth=token_info["access_token"])
+    
+    try:
+        # Search for all types, limit to 5 of each
+        results = sp.search(q=query, type='track,album,playlist', limit=5)
+        
+        formatted_results = []
+        
+        # Format tracks
+        if 'tracks' in results:
+            for item in results['tracks']['items']:
+                formatted_results.append({
+                    "type": "Track",
+                    "name": item['name'],
+                    "artist": item['artists'][0]['name'],
+                    "cover": item['album']['images'][-1]['url'] if item['album']['images'] else None, # Get smallest cover
+                    "url": item['external_urls']['spotify']
+                })
+
+        # Format albums
+        if 'albums' in results:
+            for item in results['albums']['items']:
+                formatted_results.append({
+                    "type": "Album",
+                    "name": item['name'],
+                    "artist": item['artists'][0]['name'],
+                    "cover": item['images'][-1]['url'] if item['images'] else None,
+                    "url": item['external_urls']['spotify']
+                })
+        
+        # Format playlists
+        if 'playlists' in results:
+            for item in results['playlists']['items']:
+                formatted_results.append({
+                    "type": "Playlist",
+                    "name": item['name'],
+                    "artist": f"by {item['owner']['display_name']}",
+                    "cover": item['images'][-1]['url'] if item['images'] else None,
+                    "url": item['external_urls']['spotify']
+                })
+        
+        # Return max 10 total results
+        return jsonify(formatted_results[:10]) 
+
+    except Exception as e:
+        return jsonify({"error": f"Spotify API error: {str(e)}"}), 400
+
 @app.route("/progress")
 def progress():
     session_id = session.get("token_info", {}).get("access_token")
@@ -226,7 +283,7 @@ def analyze():
             tracks_to_process = [item["track"] for item in items if item.get("track")]
             response_data.update({"name": playlist_info["name"], "owner": playlist_info["owner"]["display_name"], "cover": playlist_info["images"][0]["url"] if playlist_info["images"] else None})
     except Exception as e:
-        return jsonify({"error": f"Spotify API error: {str(e)}"}), 400
+        return jsonify({"error": f"Spotify API error: {str(e)}"}), 4Failure
 
     analysis_results = []
     total_tracks = len(tracks_to_process)
@@ -239,8 +296,3 @@ def analyze():
     response_data["tracks"] = analysis_results
     progress_store[session_id] = {"percent": 100, "current_track": ""}
     return jsonify(response_data)
-
-# <-- THIS BLOCK IS NOW REMOVED
-# if __name__ == "__main__":
-#     webbrowser.open("http://127.0.0.1:5000")
-#     app.run(host="127.0.0.1", port=5000)
