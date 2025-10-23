@@ -283,7 +283,7 @@ def analyze():
             tracks_to_process = [item["track"] for item in items if item.get("track")]
             response_data.update({"name": playlist_info["name"], "owner": playlist_info["owner"]["display_name"], "cover": playlist_info["images"][0]["url"] if playlist_info["images"] else None})
     except Exception as e:
-        return jsonify({"error": f"Spotify API error: {str(e)}"}), 4Failure
+        return jsonify({"error": f"Spotify API error: {str(e)}"}), 400
 
     analysis_results = []
     total_tracks = len(tracks_to_process)
