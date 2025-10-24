@@ -93,7 +93,7 @@ def get_lyrics_from_lrclib(title, artist, album, duration):
         synced = data.get("syncedLyrics")
         if not synced: return None, None
         lines = [(int(m) * 60 + float(s), txt.strip()) for m, s, txt in re.findall(r"\[(\d+):(\d+\.\d+)\]\s*(.*)", synced)]
-        lrclib_url = f"https://lrclib.net/track/{data.get('id')}" if data.get('id') else None
+        lrclib_url = f"https.lrclib.net/track/{data.get('id')}" if data.get('id') else None
         return lines, lrclib_url
     except Exception as e:
         print(f"⚠️ LRCLIB fetch error for '{title}': {e}")
@@ -129,7 +129,7 @@ def analyze_track_lyrics(track_obj, track_number, flagged_words):
     lyrics, genius_url = get_lyrics_from_genius(title_clean, main_artist)
     if lyrics is None:
         return {"track_number": track_number, "track_name": track_obj["name"], "status": "Lyrics Not Found", "flagged_words": [], "genius_url": None, "lrclib_url": lrclib_url}
-
+    
     found_words = [w for w in flagged_words if re.search(rf"\b{re.escape(w)}\b", lyrics, re.IGNORECASE)]
     status = "Explicit" if found_words else "Clean"
     return {"track_number": track_number, "track_name": track_obj["name"], "status": status, "flagged_words": found_words, "genius_url": genius_url, "lrclib_url": None}
@@ -172,7 +172,14 @@ def me():
     if not token_info: return jsonify({"logged_in": False}), 401
     sp = spotipy.Spotify(auth=token_info["access_token"])
     user_profile = sp.current_user()
-    return jsonify({"logged_in": True, "id": user_profile.get("id"), "name": user_profile.get("display_name", "Unknown")})
+    
+    # --- MODIFIED: Send the FCC word list along with user data ---
+    return jsonify({
+        "logged_in": True, 
+        "id": user_profile.get("id"), 
+        "name": user_profile.get("display_name", "Unknown"),
+        "fcc_words": FCC_FLAGGED_WORDS  # Send the list
+    })
 
 # --- SEARCH ROUTE (Tracks and Albums Only, Improved Relevance) ---
 @app.route("/search", methods=["POST"])
@@ -242,7 +249,7 @@ def progress():
 def analyze():
     token_info = refresh_token_if_needed()
     if not token_info: return jsonify({"error": "User not logged in. Please log in again."}), 401
-
+    
     data = request.get_json()
     url = data.get("url")
     custom_words_str = data.get("custom_words", "")
@@ -254,7 +261,15 @@ def analyze():
 
     # Decide which word list to use
     if custom_words_str.strip():
-        flagged_words_to_use = [line.strip().lower() for line in custom_words_str.splitlines() if line.strip()]
+        # --- MODIFIED: Handle comma-separated lists ---
+        # First, replace all commas with newlines
+        processed_str = custom_words_str.replace(",", "\n")
+        # Then, split by newlines as before
+        flagged_words_to_use = [
+            line.strip().lower() 
+            for line in processed_str.splitlines() 
+            if line.strip()
+        ]
     else:
         flagged_words_to_use = FCC_FLAGGED_WORDS
 
