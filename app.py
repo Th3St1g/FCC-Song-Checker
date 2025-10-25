@@ -42,10 +42,10 @@ genius = Genius(
 
 # --- Load multiple default word lists from subfolder ---
 DEFAULT_WORD_LISTS = {}
-# --- MODIFIED: Define the subfolder path ---
+# Define the subfolder path
 WORD_LIST_FOLDER = "List-of-Dirty-Naughty-Obscene-and-Otherwise-Bad-Words"
 
-# --- MODIFIED: Update filenames to include the subfolder ---
+# Update filenames to include the subfolder
 DEFAULT_LIST_FILES = {
     'ar': os.path.join(WORD_LIST_FOLDER, 'default_ar.txt'),
     'zh': os.path.join(WORD_LIST_FOLDER, 'default_zh.txt'),
@@ -96,7 +96,9 @@ for lang_code, filepath in DEFAULT_LIST_FILES.items(): # Use filepath now
         print(f"⚠️ Warning: Default list file not found: {filepath} for '{lang_code}'.")
 
 if not DEFAULT_WORD_LISTS:
-    raise ValueError("❌ No default word lists were loaded successfully!")
+    # Changed to warning instead of crashing if files are missing during dev
+    print("❌ WARNING: No default word lists were loaded successfully! Check file paths and names.")
+    # raise ValueError("❌ No default word lists were loaded successfully!") # Commented out raise
 # --- End of word list loading ---
 
 
@@ -158,7 +160,8 @@ def analyze_track_lyrics(track_obj, track_number, flagged_words):
     if not track_obj:
         return {"track_number": track_number, "track_name": "Track not available", "status": "Error", "flagged_words": [], "genius_url": None, "lrclib_url": None}
 
-    title_clean = clean_track_title(track_obj["name"])
+    track_name = track_obj.get("name", "Unknown Track")
+    title_clean = clean_track_title(track_name)
     main_artist = track_obj["artists"][0]["name"] if track_obj.get("artists") else "Unknown"
     album_name = track_obj.get("album", {}).get("name", "")
     duration = track_obj.get("duration_ms", 0) / 1000
@@ -181,32 +184,27 @@ def analyze_track_lyrics(track_obj, track_number, flagged_words):
             words_in_line = re.findall(r'\b\w+\b', line_lower)
             for word in words_in_line:
                 if word in flagged_set and ' ' not in word:
-                    # Check if this word is part of any phrase already added for this timestamp
                     part_of_found_phrase = False
                     for found_phrase in phrases_found_in_line:
-                        # Simple check if word is in the phrase's words
                         if word in found_phrase.split(): 
                            part_of_found_phrase = True
                            break
                     if not part_of_found_phrase:
                         flagged_entries.append({"timestamp": round(time_sec, 3), "context": word})
 
-        # Deduplicate final entries 
         unique_flagged = [dict(t) for t in {tuple(sorted(d.items())) for d in flagged_entries}]
         status = "Explicit" if unique_flagged else "Clean"
-        return {"track_number": track_number, "track_name": track_obj["name"], "status": status, "flagged_words": unique_flagged, "genius_url": None, "lrclib_url": lrclib_url}
+        return {"track_number": track_number, "track_name": track_name, "status": status, "flagged_words": unique_flagged, "genius_url": None, "lrclib_url": lrclib_url}
 
 
     lyrics, genius_url = get_lyrics_from_genius(title_clean, main_artist)
     if lyrics is None:
-        return {"track_number": track_number, "track_name": track_obj["name"], "status": "Lyrics Not Found", "flagged_words": [], "genius_url": None, "lrclib_url": lrclib_url}
+        return {"track_number": track_number, "track_name": track_name, "status": "Lyrics Not Found", "flagged_words": [], "genius_url": None, "lrclib_url": lrclib_url}
 
-    # Find matches using word boundaries for accuracy
     found_words = [w for w in flagged_words if re.search(rf"\b{re.escape(w)}\b", lyrics, re.IGNORECASE)]
     status = "Explicit" if found_words else "Clean"
-    # Convert back to simple list for Genius results for now
     simple_found = list(set(found_words))
-    return {"track_number": track_number, "track_name": track_obj["name"], "status": status, "flagged_words": simple_found, "genius_url": genius_url, "lrclib_url": None}
+    return {"track_number": track_number, "track_name": track_name, "status": status, "flagged_words": simple_found, "genius_url": genius_url, "lrclib_url": None}
 
 
 # --- Flask Routes ---
@@ -358,8 +356,11 @@ def analyze():
         if url_type == 'track':
             track_info = sp.track(item_id)
             tracks_to_process = [track_info] if track_info else []
-            if tracks_to_process:
+            if tracks_to_process and track_info.get("album"): # Check album exists
                  response_data.update({"name": track_info["album"]["name"], "artist": track_info["artists"][0]["name"], "album_cover": track_info["album"]["images"][0]["url"] if track_info["album"]["images"] else None})
+            elif tracks_to_process: # Track exists but no album info? Use track info.
+                 response_data.update({"name": track_info["name"], "artist": track_info["artists"][0]["name"], "album_cover": None})
+
         elif url_type == 'album':
             album_info = sp.album(item_id)
             if not album_info: raise Exception("Album not found or unavailable.")
@@ -372,12 +373,14 @@ def analyze():
                  if not batch_ids: break # Avoid empty request
                  try:
                     batch_tracks = sp.tracks(batch_ids)
-                    full_track_objects.extend(t for t in batch_tracks['tracks'] if t) # Filter None tracks
+                    # Filter out potential None objects in the 'tracks' list
+                    full_track_objects.extend(t for t in batch_tracks['tracks'] if t) 
                  except spotipy.exceptions.SpotifyException as batch_error:
                     print(f"Warning: Error fetching batch of album tracks: {batch_error}")
                  offset += 50
             tracks_to_process = full_track_objects
             response_data.update({"name": album_info["name"], "artist": album_info["artists"][0]["name"], "album_cover": album_info["images"][0]["url"] if album_info["images"] else None})
+        
         elif url_type == 'playlist':
             playlist_info = sp.playlist(item_id, fields='name,owner.display_name,images,tracks.total,tracks.next')
             if not playlist_info: raise Exception("Playlist not found or unavailable.")
@@ -389,9 +392,11 @@ def analyze():
             while True:
                 try:
                     results = sp.playlist_items(item_id,
-                                                fields='items(track(id,name,artists,album(name,images),duration_ms,external_urls)),next,offset,total',
+                                                fields='items(is_local,track(id,name,artists,album(name,images),duration_ms,external_urls)),next,offset,total', # Added is_local
                                                 limit=limit, offset=offset)
-                    items.extend(item for item in results['items'] if item and item.get('track')) # Filter None items/tracks
+                    # Filter out None items, None tracks, and local tracks
+                    items.extend(item for item in results['items'] 
+                                 if item and not item.get('is_local') and item.get('track')) 
                     offset += limit
                     if results['next'] is None: break 
                 except spotipy.exceptions.SpotifyException as page_error:
@@ -399,7 +404,7 @@ def analyze():
                      break 
                 time.sleep(0.05)
 
-            tracks_to_process = [item["track"] for item in items]
+            tracks_to_process = [item["track"] for item in items] # Already filtered Nones and local
 
     except Exception as e:
         print(f"!!! Spotify API Error during item fetch: {str(e)}")
@@ -415,6 +420,7 @@ def analyze():
              return jsonify({"error": "Could not retrieve track data. The URL might be invalid or the track unavailable."}), 400
         response_data["tracks"] = []
         if session_id in progress_store: del progress_store[session_id]
+        print("Analysis finished: No processable tracks found.")
         return jsonify(response_data) # Return empty results
 
 
@@ -426,10 +432,28 @@ def analyze():
                 "flagged_words": [], "genius_url": None, "lrclib_url": None
             })
             continue
-
-        progress_store[session_id] = {"percent": int((idx / total_tracks) * 100), "current_track": track_obj.get("name", "Processing...")}
-        result = analyze_track_lyrics(track_obj, idx, final_word_list) # Use final list
-        analysis_results.append(result)
+            
+        # Ensure track_obj has necessary structure, especially for playlists
+        # Sometimes playlist tracks lack full album info directly, add basic structure if missing
+        if 'album' not in track_obj or track_obj['album'] is None:
+            track_obj['album'] = {'name': '', 'images': []}
+        if 'artists' not in track_obj or not track_obj['artists']:
+             track_obj['artists'] = [{'name': 'Unknown Artist'}]
+             
+        current_track_name = track_obj.get("name", f"Track {idx}")
+        print(f"Analyzing track {idx}/{total_tracks}: {current_track_name}")
+        progress_store[session_id] = {"percent": int((idx / total_tracks) * 100), "current_track": current_track_name}
+        
+        try:
+            result = analyze_track_lyrics(track_obj, idx, final_word_list) # Use final list
+            analysis_results.append(result)
+        except Exception as track_error:
+             print(f"!!! Error analyzing track '{current_track_name}': {track_error}")
+             analysis_results.append({
+                "track_number": idx, "track_name": current_track_name, "status": "Analysis Error",
+                "flagged_words": [], "genius_url": None, "lrclib_url": None
+            })
+            
         time.sleep(0.1) # Keep rate limiting
 
     response_data["tracks"] = analysis_results
@@ -438,9 +462,13 @@ def analyze():
            del progress_store[session_id] # Clear progress 
         except KeyError:
              print(f"Warning: Could not clear progress for session {session_id}, key already removed.")
+    print("Analysis finished successfully.")
     return jsonify(response_data)
 
 
 if __name__ == "__main__":
     is_production = os.environ.get('RENDER', False)
+    # Ensure the build folder exists if running locally for testing frontend
+    if not is_production and not os.path.exists('build'):
+        print("WARNING: 'build' folder not found. Frontend may not be served.")
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)), debug=not is_production)
