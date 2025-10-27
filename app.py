@@ -35,7 +35,7 @@ sp_oauth = SpotifyOAuth(
 GENIUS_ACCESS_TOKEN = os.getenv("GENIUS_API_TOKEN")
 if not GENIUS_ACCESS_TOKEN:
     print("⚠️ WARNING: GENIUS_API_TOKEN environment variable not set. Genius lookup will fail.", flush=True)
-    genius = None # Set genius to None if key is missing
+    genius = None
 else:
     try:
         genius = Genius(
@@ -43,12 +43,15 @@ else:
             skip_non_songs=True,
             excluded_terms=["(Live)"],
             remove_section_headers=True,
-            verbose=False # Set verbose to False to reduce library's own console noise
+            verbose=False,
+            # --- ADD THIS LINE ---
+            user_agent="Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            # --- END ADD ---
         )
         print("✅ Genius client initialized.", flush=True)
     except Exception as e:
         print(f"❌ Error initializing Genius client: {e}", flush=True)
-        genius = None # Set genius to None on initialization error
+        genius = None
 
 # --- Load multiple default word lists from subfolder ---
 DEFAULT_WORD_LISTS = {}
