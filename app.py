@@ -5,12 +5,13 @@ from spotipy.oauth2 import SpotifyOAuth
 import os
 import json
 import re
-from datetime import datetime
+from datetime import datetime, timedelta
 # REMOVED: from lyricsgenius import Genius
 from dotenv import load_dotenv
 import time
 import webbrowser
 import requests
+from functools import lru_cache
 
 # Load environment variables
 load_dotenv()
@@ -30,6 +31,22 @@ sp_oauth = SpotifyOAuth(
     redirect_uri=os.getenv("SPOTIPY_REDIRECT_URI"),
     scope="user-read-private"
 )
+
+# --- Pre-compiled regex patterns for performance ---
+SPOTIFY_URL_PATTERN = re.compile(r"open\.spotify\.com/(track|album|playlist)/([a-zA-Z0-9]+)")
+FEAT_PATTERN = re.compile(r"\s+\(feat\.[^)]+\)", re.IGNORECASE)
+FEAT_BRACKET_PATTERN = re.compile(r"\s+\[feat\.[^]]+\]", re.IGNORECASE)
+VERSION_PATTERN = re.compile(r"\s+\((Remix|Live|Acoustic|Radio Edit)\)", re.IGNORECASE)
+SUFFIX_PATTERN = re.compile(r"\s+-\s+(Remix|Live|Acoustic|Radio Edit|From .*|Mono|Stereo)", re.IGNORECASE)
+PART_VOL_PATTERN = re.compile(r"\s+\((Pt\.|Vol\.)\s*\d+\)", re.IGNORECASE)
+LRCLIB_TIME_PATTERN = re.compile(r"\[(\d+):(\d+\.\d+)\]\s*(.*)")
+WORD_BOUNDARY_PATTERN = re.compile(r'\b\w+\b')
+
+# --- Requests session for connection pooling ---
+requests_session = requests.Session()
+adapter = requests.adapters.HTTPAdapter(pool_connections=10, pool_maxsize=20, max_retries=3)
+requests_session.mount('http://', adapter)
+requests_session.mount('https://', adapter)
 
 # --- REMOVED: Genius API setup ---
 # GENIUS_ACCESS_TOKEN = os.getenv("GENIUS_API_TOKEN")
@@ -76,7 +93,8 @@ for lang_code, filepath in DEFAULT_LIST_FILES.items():
     if os.path.exists(filepath):
         try:
             with open(filepath, "r", encoding="utf-8") as f:
-                words = [line.strip().lower() for line in f if line.strip()]
+                # Use set for O(1) lookup performance instead of list
+                words = {line.strip().lower() for line in f if line.strip()}
                 if words:
                     DEFAULT_WORD_LISTS[lang_code] = words
                     print(f"✅ Loaded {len(words)} words for '{lang_code}' from {filepath}.", flush=True)
@@ -91,12 +109,28 @@ if loaded_list_count == 0:
     print("❌ WARNING: No default word lists were loaded successfully! Check file paths and names.", flush=True)
 # --- End of word list loading ---
 
+# Progress store with automatic cleanup
 progress_store = {}
+progress_store_timestamps = {}  # Track when entries were created for cleanup
 
 # --- Helper Functions ---
 
+def cleanup_old_progress_entries():
+    """Remove progress entries older than 1 hour to prevent memory leaks"""
+    now = datetime.now()
+    keys_to_delete = [
+        key for key, timestamp in progress_store_timestamps.items()
+        if now - timestamp > timedelta(hours=1)
+    ]
+    for key in keys_to_delete:
+        progress_store.pop(key, None)
+        progress_store_timestamps.pop(key, None)
+    if keys_to_delete:
+        print(f"Cleaned up {len(keys_to_delete)} old progress entries.", flush=True)
+
 def parse_spotify_url(url):
-    match = re.search(r"open\.spotify\.com/(track|album|playlist)/([a-zA-Z0-9]+)", url)
+    """Parse Spotify URL using pre-compiled regex"""
+    match = SPOTIFY_URL_PATTERN.search(url)
     return match.groups() if match else (None, None)
 
 def refresh_token_if_needed():
@@ -116,19 +150,20 @@ def refresh_token_if_needed():
             session.clear(); return None
     return token_info
 
+@lru_cache(maxsize=512)
 def clean_track_title(title):
-    # (No changes needed here)
-    title = re.sub(r"\s+\(feat\.[^)]+\)", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\s+\[feat\.[^]]+\]", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\s+\((Remix|Live|Acoustic|Radio Edit)\)", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\s+-\s+(Remix|Live|Acoustic|Radio Edit|From .*|Mono|Stereo)", "", title, flags=re.IGNORECASE)
-    title = re.sub(r"\s+\((Pt\.|Vol\.)\s*\d+\)", "", title, flags=re.IGNORECASE)
+    """Clean track title using pre-compiled regex patterns (cached for performance)"""
+    title = FEAT_PATTERN.sub("", title)
+    title = FEAT_BRACKET_PATTERN.sub("", title)
+    title = VERSION_PATTERN.sub("", title)
+    title = SUFFIX_PATTERN.sub("", title)
+    title = PART_VOL_PATTERN.sub("", title)
     title = title.strip(' -')
     return title.strip()
 
 def get_lyrics_from_lrclib(title, artist, album, duration):
     """
-    Fetches lyrics from LRCLIB.
+    Fetches lyrics from LRCLIB using connection pooling.
 
     Returns:
         tuple: (synced_lines, lrclib_url, plain_lyrics)
@@ -140,7 +175,8 @@ def get_lyrics_from_lrclib(title, artist, album, duration):
     params = { "track_name": title, "artist_name": artist, "album_name": album, "duration": int(duration) }
     headers = {"User-Agent": "FCCSongChecker/1.0 (Backend)"}
     try:
-        response = requests.get(url, params=params, headers=headers, timeout=10)
+        # Use session for connection pooling
+        response = requests_session.get(url, params=params, headers=headers, timeout=10)
         print(f"LRCLIB request for '{title}' status: {response.status_code}", flush=True)
         if response.status_code != 200:
             return None, None, None
@@ -152,7 +188,9 @@ def get_lyrics_from_lrclib(title, artist, album, duration):
 
         synced_lines = None
         if synced:
-            synced_lines = [(int(m) * 60 + float(s), txt.strip()) for m, s, txt in re.findall(r"\[(\d+):(\d+\.\d+)\]\s*(.*)", synced)]
+            # Use pre-compiled regex pattern
+            matches = LRCLIB_TIME_PATTERN.findall(synced)
+            synced_lines = [(int(m) * 60 + float(s), txt.strip()) for m, s, txt in matches if txt.strip()]
             if synced_lines:
                 print(f"LRCLIB SUCCESS for '{title}' - Found {len(synced_lines)} synced lines.", flush=True)
             else:
@@ -174,6 +212,7 @@ def get_lyrics_from_lrclib(title, artist, album, duration):
 
 # --- MODIFIED: analyze_track_lyrics NO Genius fallback ---
 def analyze_track_lyrics(track_obj, track_number, flagged_words):
+    """Optimized track lyrics analysis with efficient word matching"""
     if not track_obj:
         return {"track_number": track_number, "track_name": "Track not available", "status": "Error", "flagged_words": [], "lrclib_url": None}
 
@@ -188,27 +227,39 @@ def analyze_track_lyrics(track_obj, track_number, flagged_words):
     # --- Try LRCLIB ---
     lrclib_lines, lrclib_url, plain_lyrics = get_lyrics_from_lrclib(title_clean_search, main_artist, album_name, duration)
 
+    # Pre-compute sets for efficient lookups
+    flagged_set = set(flagged_words) if not isinstance(flagged_words, set) else flagged_words
+    phrases = {w for w in flagged_set if ' ' in w}
+    single_words = flagged_set - phrases
+
     # --- 1. Process LRCLIB Synced Lyrics (Highest Priority) ---
     if lrclib_lines is not None and len(lrclib_lines) > 0:
         print(f"Processing LRCLIB SYNCED results for '{track_name}'.", flush=True)
         flagged_entries = []
-        flagged_set = set(flagged_words)
+
         for time_sec, line_text in lrclib_lines:
-            line_lower = line_text.lower(); phrases_found_in_line = set()
-            for phrase in flagged_set:
-                if ' ' in phrase and phrase in line_lower:
-                    flagged_entries.append({"timestamp": round(time_sec, 3), "context": phrase}); phrases_found_in_line.add(phrase)
-            words_in_line = re.findall(r'\b\w+\b', line_lower)
-            for word in words_in_line:
-                if word in flagged_set and ' ' not in word:
-                    part_of_found_phrase = False
-                    for found_phrase in phrases_found_in_line:
-                        if word in found_phrase.split(): part_of_found_phrase = True; break
-                    if not part_of_found_phrase: flagged_entries.append({"timestamp": round(time_sec, 3), "context": word})
+            line_lower = line_text.lower()
+            phrases_found_in_line = set()
+
+            # Check phrases first (more specific)
+            for phrase in phrases:
+                if phrase in line_lower:
+                    flagged_entries.append({"timestamp": round(time_sec, 3), "context": phrase})
+                    phrases_found_in_line.add(phrase)
+
+            # Check single words (skip if part of found phrase)
+            if single_words:
+                words_in_line = WORD_BOUNDARY_PATTERN.findall(line_lower)
+                phrase_words = {word for phrase in phrases_found_in_line for word in phrase.split()}
+
+                for word in words_in_line:
+                    if word in single_words and word not in phrase_words:
+                        flagged_entries.append({"timestamp": round(time_sec, 3), "context": word})
+
+        # Remove duplicates efficiently
         unique_flagged = [dict(t) for t in {tuple(sorted(d.items())) for d in flagged_entries}]
         status = "Explicit" if unique_flagged else "Clean"
         print(f"LRCLIB SYNCED Result for '{track_name}': Status={status}, Found={len(unique_flagged)}.", flush=True)
-        # REMOVED genius_url
         return {"track_number": track_number, "track_name": track_name, "status": status,
                  "flagged_words": unique_flagged, "lrclib_url": lrclib_url}
 
@@ -216,20 +267,31 @@ def analyze_track_lyrics(track_obj, track_number, flagged_words):
     elif plain_lyrics is not None and plain_lyrics.strip():
         print(f"Processing LRCLIB PLAIN results for '{track_name}'.", flush=True)
         lyrics_lower = plain_lyrics.lower()
-        found_words = [w for w in flagged_words if re.search(rf"\b{re.escape(w)}\b", lyrics_lower, re.IGNORECASE)]
+
+        # Optimized word search using set comprehension
+        found_words = []
+        for word in flagged_set:
+            # Use simple string search for phrases, word boundary for single words
+            if ' ' in word:
+                if word in lyrics_lower:
+                    found_words.append(word)
+            else:
+                # More efficient than regex for each word
+                pattern = f"\\b{re.escape(word)}\\b"
+                if re.search(pattern, lyrics_lower):
+                    found_words.append(word)
+
         status = "Explicit" if found_words else "Clean"
         simple_found = list(set(found_words))
         print(f"LRCLIB PLAIN Result for '{track_name}': Status={status}, Found={len(simple_found)}.", flush=True)
-        # REMOVED genius_url
         return {"track_number": track_number, "track_name": track_name, "status": status,
                  "flagged_words": simple_found, "lrclib_url": lrclib_url}
 
     # --- 3. Report Not Found (If ALL LRCLIB options failed/empty) ---
     else:
         print(f"LRCLIB failed (no synced or plain lyrics) for '{track_name}'. Reporting 'Lyrics Not Found'.", flush=True)
-        # REMOVED genius_url
         return {"track_number": track_number, "track_name": track_name, "status": "Lyrics Not Found",
-                 "flagged_words": [], "lrclib_url": lrclib_url} # Keep lrclib_url if found
+                 "flagged_words": [], "lrclib_url": lrclib_url}
 # --- End modification ---
 
 
@@ -290,10 +352,14 @@ def me():
         user_id = user_profile.get("id")
         if user_id: session["user_id"] = user_id
         print(f"GET /me: User '{user_profile.get('display_name')}' logged in (ID: {user_id}).", flush=True)
+
+        # Convert sets to lists for JSON serialization
+        word_lists_for_frontend = {lang: list(words) for lang, words in DEFAULT_WORD_LISTS.items()}
+
         return jsonify({
             "logged_in": True, "id": user_id,
             "name": user_profile.get("display_name", "Unknown"),
-            "default_word_lists": DEFAULT_WORD_LISTS
+            "default_word_lists": word_lists_for_frontend
         })
     except Exception as e:
         print(f"❌ Error fetching user profile from Spotify: {e}", flush=True)
@@ -348,6 +414,9 @@ def progress():
 
 @app.route("/analyze", methods=["POST"])
 def analyze():
+    # Clean up old progress entries to prevent memory leaks
+    cleanup_old_progress_entries()
+
     token_info = refresh_token_if_needed()
     if not token_info: return jsonify({"error": "User not logged in. Please log in again."}), 401
     data = request.get_json(); url = data.get("url")
@@ -355,28 +424,37 @@ def analyze():
     if not url: return jsonify({"error": "No URL provided."}), 400
     print(f"\n--- POST /analyze: URL='{url}' ---", flush=True)
     user_id = session.get("user_id"); session_key = user_id or token_info["access_token"]
+
+    # Initialize progress with timestamp
     progress_store[session_key] = {"percent": 0, "current_track": ""}
+    progress_store_timestamps[session_key] = datetime.now()
+
+    # Build flagged words set (keep as set for performance)
     flagged_words_to_use = set()
     if custom_words_str.strip():
         print("Using custom word list provided by user.", flush=True)
         processed_str = custom_words_str.replace(",", "\n")
-        custom_list = [line.strip().lower() for line in processed_str.splitlines() if line.strip()]
+        custom_list = {line.strip().lower() for line in processed_str.splitlines() if line.strip()}
         flagged_words_to_use.update(custom_list)
     else:
         print(f"Using selected default lists: {selected_defaults}", flush=True)
         for lang_code in selected_defaults:
-            if lang_code in DEFAULT_WORD_LISTS: flagged_words_to_use.update(DEFAULT_WORD_LISTS[lang_code])
-            else: print(f"Warning: Requested default list '{lang_code}' not found/loaded on backend.", flush=True)
-    final_word_list = list(flagged_words_to_use)
-    if not final_word_list:
+            if lang_code in DEFAULT_WORD_LISTS:
+                flagged_words_to_use.update(DEFAULT_WORD_LISTS[lang_code])
+            else:
+                print(f"Warning: Requested default list '{lang_code}' not found/loaded on backend.", flush=True)
+
+    if not flagged_words_to_use:
         print("Error: No flagged words selected or provided.", flush=True)
-        if session_key in progress_store: del progress_store[session_key]
+        progress_store.pop(session_key, None)
+        progress_store_timestamps.pop(session_key, None)
         return jsonify({"error": "No flagged words selected or provided."}), 400
-    print(f"Analyzing with {len(final_word_list)} unique words.", flush=True)
+    print(f"Analyzing with {len(flagged_words_to_use)} unique words.", flush=True)
     url_type, item_id = parse_spotify_url(url)
     if not url_type or not item_id:
          print(f"Error: Invalid Spotify URL format: {url}", flush=True)
-         if session_key in progress_store: del progress_store[session_key]
+         progress_store.pop(session_key, None)
+         progress_store_timestamps.pop(session_key, None)
          return jsonify({"error": "Invalid or unsupported Spotify URL format."}), 400
     sp = spotipy.Spotify(auth=token_info["access_token"])
     tracks_to_process = []; response_data = {"type": url_type}
@@ -417,17 +495,20 @@ def analyze():
         print(f"Found {len(tracks_to_process)} tracks to process.", flush=True)
     except Exception as e:
         print(f"❌ POST /analyze: Spotify API Error during item fetch: {str(e)}", flush=True)
-        if session_key in progress_store: del progress_store[session_key]
+        progress_store.pop(session_key, None)
+        progress_store_timestamps.pop(session_key, None)
         if isinstance(e, spotipy.exceptions.SpotifyException): return jsonify({"error": f"Spotify API error ({e.http_status}): {e.msg}"}), e.http_status or 500
         return jsonify({"error": f"Spotify API error: {str(e)}"}), 500
     analysis_results = []; total_tracks = len(tracks_to_process)
     if total_tracks == 0:
         if url_type == 'track':
              print(f"Error: Could not retrieve track data for ID {item_id}.", flush=True)
-             if session_key in progress_store: del progress_store[session_key]
+             progress_store.pop(session_key, None)
+             progress_store_timestamps.pop(session_key, None)
              return jsonify({"error": "Could not retrieve track data. The URL might be invalid or the track unavailable."}), 400
         response_data["tracks"] = []
-        if session_key in progress_store: del progress_store[session_key]
+        progress_store.pop(session_key, None)
+        progress_store_timestamps.pop(session_key, None)
         print("Analysis finished: No processable tracks found.", flush=True)
         return jsonify(response_data)
     for idx, track_obj in enumerate(tracks_to_process, start=1):
@@ -439,17 +520,21 @@ def analyze():
         if 'artists' not in track_obj or not track_obj['artists']: track_obj['artists'] = [{'name': 'Unknown Artist'}]
         current_track_name = track_obj.get("name", f"Track {idx}")
         progress_store[session_key] = {"percent": int((idx / total_tracks) * 100), "current_track": current_track_name}
-        try: result = analyze_track_lyrics(track_obj, idx, final_word_list); analysis_results.append(result)
+        try:
+            # Pass set for optimal performance
+            result = analyze_track_lyrics(track_obj, idx, flagged_words_to_use)
+            analysis_results.append(result)
         except Exception as track_error:
              import traceback
              print(f"❌❌❌ UNEXPECTED Error analyzing track '{current_track_name}' (Index {idx-1}): {track_error}\n{traceback.format_exc()}", flush=True)
-             # REMOVED genius_url
              analysis_results.append({"track_number": idx, "track_name": current_track_name, "status": "Analysis Error", "flagged_words": [], "lrclib_url": None})
         time.sleep(0.05)
     response_data["tracks"] = analysis_results
-    if session_key in progress_store:
-        try: del progress_store[session_key]
-        except KeyError: pass
+
+    # Clean up progress tracking
+    progress_store.pop(session_key, None)
+    progress_store_timestamps.pop(session_key, None)
+
     print("Analysis finished successfully.", flush=True)
     return jsonify(response_data)
 
